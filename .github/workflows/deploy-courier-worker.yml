@@ -53,3 +53,5 @@ jobs:
 
           print('Cloudflare Worker content deployment succeeded; existing bindings and settings were left untouched.')
           PY
+
+# Triggered after PATCH33 delivery photo upload fix.
