@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "worker.js"
+      - ".github/workflows/deploy-courier-worker.yml"
   workflow_dispatch:
 
 permissions:
