@@ -1,0 +1,70 @@
+name: Fix delivery photo upload
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/fix-delivery-photo-upload.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fix delivery photo event compatibility and preview CSP
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('worker.js')
+          text = path.read_text()
+
+          changes = 0
+
+          old = "VALUES (?, ?, 'delivery_photo_uploaded', ?)"
+          new = "VALUES (?, ?, 'note_added', ?)"
+          if old in text:
+              text = text.replace(old, new, 1)
+              changes += 1
+
+          old_force = "VALUES (?, ?, 'force_closed', ?)"
+          new_force = "VALUES (?, ?, 'note_added', ?)"
+          if old_force in text:
+              text = text.replace(old_force, new_force, 1)
+              changes += 1
+
+          old_csp = '"img-src \'self\' data:",'
+          new_csp = '"img-src \'self\' data: blob:",'
+          if old_csp in text:
+              text = text.replace(old_csp, new_csp, 1)
+              changes += 1
+
+          old_build = 'PATCH32-APPROVAL-QUEUE-DELETE-FIX";'
+          new_build = 'PATCH32-APPROVAL-QUEUE-DELETE-FIX+PATCH33-DELIVERY-PHOTO-UPLOAD-FIX";'
+          if new_build not in text and old_build in text:
+              text = text.replace(old_build, new_build, 1)
+              changes += 1
+
+          if changes == 0:
+              raise SystemExit('No expected delivery photo patch targets were found')
+
+          path.write_text(text)
+          print(f'Applied {changes} delivery photo fixes')
+          PY
+      - name: Check Worker JavaScript syntax
+        run: node --check worker.js
+      - name: Commit fix
+        run: |
+          if git diff --quiet -- worker.js; then
+            echo "No changes needed."
+            exit 0
+          fi
+          git config user.name "SorrinMelbourne"
+          git config user.email "speak2salem@gmail.com"
+          git add worker.js
+          git commit -m "Fix delivery photo upload and preview"
+          git push origin main
