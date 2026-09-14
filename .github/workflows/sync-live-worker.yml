@@ -1,0 +1,87 @@
+name: Sync live courier worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/sync-live-worker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download currently deployed Cloudflare Worker source
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -D /tmp/headers.txt \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/sorrin-courier-api" \
+            -o /tmp/worker-response.bin
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          headers = Path('/tmp/headers.txt').read_text(errors='ignore')
+          raw = Path('/tmp/worker-response.bin').read_bytes()
+          m = re.search(r'content-type:\s*([^\r\n]+)', headers, re.I)
+          ctype = m.group(1).strip() if m else ''
+
+          if 'multipart/' not in ctype.lower():
+              text = raw.decode('utf-8')
+              Path('worker.js').write_text(text)
+              print(f'Saved plain worker source ({len(text)} chars)')
+          else:
+              bm = re.search(r'boundary=(?:"([^"]+)"|([^;\s]+))', ctype, re.I)
+              if not bm:
+                  raise SystemExit(f'Could not parse multipart boundary from {ctype}')
+              boundary = (bm.group(1) or bm.group(2)).encode()
+              candidates = []
+              for part in raw.split(b'--' + boundary):
+                  if b'\r\n\r\n' not in part:
+                      continue
+                  head, body = part.split(b'\r\n\r\n', 1)
+                  body = body.rstrip(b'\r\n-')
+                  try:
+                      text = body.decode('utf-8')
+                  except UnicodeDecodeError:
+                      continue
+                  score = 0
+                  lowhead = head.lower()
+                  if b'javascript' in lowhead: score += 4
+                  if b'name=' in lowhead: score += 1
+                  if 'operations' in text: score += 3
+                  if 'export default' in text or 'addEventListener' in text: score += 3
+                  candidates.append((score, len(text), text, head.decode(errors='ignore')))
+              if not candidates:
+                  raise SystemExit('No textual module found in multipart Worker response')
+              candidates.sort(reverse=True)
+              score, size, text, head = candidates[0]
+              Path('worker.js').write_text(text)
+              print(f'Saved multipart worker source ({size} chars, score={score}) from part {head[:200]}')
+
+          text = Path('worker.js').read_text()
+          if len(text) < 10000 or 'operations' not in text.lower():
+              raise SystemExit('Downloaded source does not look like the courier Worker; refusing to commit')
+          PY
+
+      - name: Commit live Worker source into repository
+        run: |
+          if git diff --quiet -- worker.js && git ls-files --error-unmatch worker.js >/dev/null 2>&1; then
+            echo "worker.js already matches the deployed Worker."
+            exit 0
+          fi
+          git config user.name "SorrinMelbourne"
+          git config user.email "speak2salem@gmail.com"
+          git add worker.js
+          git commit -m "Sync current live courier Worker source"
+          git push origin main
