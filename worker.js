@@ -18,7 +18,7 @@ function corsHeaders(request) {
 
 const OPS_COOKIE_NAME = "sorrin_ops_session";
 const OPS_SESSION_SECONDS = 60 * 60 * 12;
-const OPS_BUILD = "FINAL-V21-SUMMARY-FINANCE-NAV+A022-SORRINBOT-FINANCE+A027-BUSINESS-PROFILE+A035-MEMBERSHIP-LIST+A037-CONSULTATION-REQUEST+A039-SESSION-RESUME+PATCH30-USC-ONLY-BOOKING+V22-MANDATORY-DELIVERY-PHOTO+PATCH31-FIRST-TWO-JOBS-FREE+PATCH32-APPROVAL-QUEUE-DELETE-FIX";
+const OPS_BUILD = "FINAL-V21-SUMMARY-FINANCE-NAV+A022-SORRINBOT-FINANCE+A027-BUSINESS-PROFILE+A035-MEMBERSHIP-LIST+A037-CONSULTATION-REQUEST+A039-SESSION-RESUME+PATCH30-USC-ONLY-BOOKING+V22-MANDATORY-DELIVERY-PHOTO+PATCH31-FIRST-TWO-JOBS-FREE+PATCH32-APPROVAL-QUEUE-DELETE-FIX+PATCH33-DELIVERY-PHOTO-UPLOAD-FIX";
 const SORRINBOT_USC_SESSION_VERSION = "1.0.0";
 const SORRINBOT_USC_REGISTRATION_VERSION = "A017-1.0.0";
 const SORRINBOT_REPEAT_JOB_VERSION = "A018-1.0.0";
@@ -83,7 +83,7 @@ function textResponse(body, status = 200, headers = {}) {
         "default-src 'self'",
         "style-src 'unsafe-inline'",
         "script-src 'unsafe-inline'",
-        "img-src 'self' data:",
+        "img-src 'self' data: blob:",
         "connect-src 'self'",
         "base-uri 'none'",
         "form-action 'self'",
@@ -5847,7 +5847,7 @@ async function operationsApi(request, env, url) {
       ),
       env.DB.prepare(
         `INSERT INTO job_events (id, job_id, event_type, event_data)
-         VALUES (?, ?, 'delivery_photo_uploaded', ?)`,
+         VALUES (?, ?, 'note_added', ?)`,
       ).bind(crypto.randomUUID(), current.jobId, JSON.stringify(eventData)),
     ];
     if (current.businessId) {
@@ -6611,7 +6611,7 @@ async function operationsApi(request, env, url) {
       ),
       env.DB.prepare(
         `INSERT INTO job_events (id, job_id, event_type, event_data)
-         VALUES (?, ?, 'force_closed', ?)`,
+         VALUES (?, ?, 'note_added', ?)`,
       ).bind(crypto.randomUUID(), current.jobId, eventData),
     ]);
     return operationsJson({ job: await operationsJobDetail(env, reference) });
