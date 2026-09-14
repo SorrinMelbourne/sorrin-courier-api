@@ -1,0 +1,23 @@
+name: Fix delivery proof table
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/fix-delivery-proof-table.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create missing delivery_proof_photos table in production D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx wrangler@latest d1 execute sorrin-courier-db --remote --command "CREATE TABLE IF NOT EXISTS delivery_proof_photos (id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE, booking_id TEXT, booking_reference TEXT NOT NULL, object_key TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, uploaded_by TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))); CREATE INDEX IF NOT EXISTS idx_delivery_proof_photos_booking_id ON delivery_proof_photos(booking_id); CREATE INDEX IF NOT EXISTS idx_delivery_proof_photos_booking_reference ON delivery_proof_photos(booking_reference);"
+          npx wrangler@latest d1 execute sorrin-courier-db --remote --command "SELECT name, sql FROM sqlite_master WHERE type='table' AND name='delivery_proof_photos';"
