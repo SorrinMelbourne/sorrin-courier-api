@@ -22,73 +22,34 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check Worker JavaScript syntax
         run: node --check worker.js
-      - name: Publish worker.js while preserving live Cloudflare bindings
+      - name: Publish Worker code without changing Cloudflare bindings or settings
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          API="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/sorrin-courier-api"
-          curl -fsSL \
+          API="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/sorrin-courier-api/content"
+
+          HTTP_CODE=$(curl -sS -o /tmp/deploy-result.json -w "%{http_code}" -X PUT \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -D /tmp/live-headers.txt \
-            "$API" \
-            -o /tmp/live-worker.bin
+            -F 'metadata={"main_module":"worker.js"};type=application/json' \
+            -F 'worker.js=@worker.js;type=application/javascript+module' \
+            "$API")
 
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          headers = Path('/tmp/live-headers.txt').read_text(errors='ignore')
-          raw = Path('/tmp/live-worker.bin').read_bytes()
-          source = Path('worker.js').read_bytes()
-          m = re.search(r'content-type:\s*([^\r\n]+)', headers, re.I)
-          if not m:
-              raise SystemExit('Cloudflare did not return a Content-Type for the live Worker')
-          ctype = m.group(1).strip()
-          Path('/tmp/content-type.txt').write_text(ctype)
-
-          if 'multipart/' not in ctype.lower():
-              raise SystemExit('Expected a multipart Worker script so bindings can be preserved safely')
-
-          bm = re.search(r'boundary=(?:"([^"]+)"|([^;\s]+))', ctype, re.I)
-          if not bm:
-              raise SystemExit(f'Could not parse multipart boundary from {ctype}')
-          boundary = (bm.group(1) or bm.group(2)).encode()
-          marker = b'--' + boundary
-          chunks = raw.split(marker)
-          replaced = 0
-          rebuilt = []
-          for chunk in chunks:
-              if b'\r\n\r\n' in chunk:
-                  head, body = chunk.split(b'\r\n\r\n', 1)
-                  if re.search(br'content-disposition:[^\r\n]*name="worker\.js"', head, re.I):
-                      ending = b''
-                      if body.endswith(b'\r\n'):
-                          ending = b'\r\n'
-                      body = source + ending
-                      chunk = head + b'\r\n\r\n' + body
-                      replaced += 1
-              rebuilt.append(chunk)
-          if replaced != 1:
-              raise SystemExit(f'Expected exactly one worker.js multipart part; found {replaced}')
-          Path('/tmp/upload-worker.bin').write_bytes(marker.join(rebuilt))
-          print('Prepared Worker upload with existing bindings/metadata preserved.')
-          PY
-
-          CONTENT_TYPE="$(cat /tmp/content-type.txt)"
-          curl -fsS -X PUT \
-            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -H "Content-Type: ${CONTENT_TYPE}" \
-            --data-binary @/tmp/upload-worker.bin \
-            "$API" \
-            -o /tmp/deploy-result.json
-
-          python3 - <<'PY'
+          python3 - "$HTTP_CODE" <<'PY'
           import json
+          import sys
           from pathlib import Path
-          data = json.loads(Path('/tmp/deploy-result.json').read_text())
-          if data.get('success') is not True:
-              raise SystemExit('Cloudflare rejected the Worker deployment: ' + json.dumps(data.get('errors') or data))
-          print('Cloudflare Worker deployment succeeded.')
+
+          status = int(sys.argv[1])
+          raw = Path('/tmp/deploy-result.json').read_text(errors='replace')
+          try:
+              data = json.loads(raw)
+          except Exception:
+              raise SystemExit(f'Cloudflare returned HTTP {status}: {raw[:1000]}')
+
+          if status >= 400 or data.get('success') is not True:
+              raise SystemExit(f'Cloudflare Worker deployment failed (HTTP {status}): {json.dumps(data.get("errors") or data)}')
+
+          print('Cloudflare Worker content deployment succeeded; existing bindings and settings were left untouched.')
           PY
