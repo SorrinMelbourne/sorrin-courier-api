@@ -1,0 +1,82 @@
+name: Patch approvals queue and delete flow
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/patch-approval-queue-delete.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update Operations approval UX and archive event compatibility
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('worker.js')
+          text = path.read_text()
+
+          def replace_between(src, start_marker, end_marker, replacement):
+              start = src.find(start_marker)
+              if start < 0:
+                  raise SystemExit(f'Missing start marker: {start_marker}')
+              end = src.find(end_marker, start)
+              if end < 0:
+                  raise SystemExit(f'Missing end marker: {end_marker}')
+              return src[:start] + replacement + src[end:]
+
+          # Keep job_events inside the existing production CHECK constraint.
+          text = text.replace("VALUES (?, ?, 'archived', ?)", "VALUES (?, ?, 'note_added', ?)")
+          text = text.replace("VALUES (?, ?, 'restored', ?)", "VALUES (?, ?, 'note_added', ?)")
+
+          # Bump build identifier.
+          old_build = 'PATCH31-FIRST-TWO-JOBS-FREE";'
+          new_build = 'PATCH31-FIRST-TWO-JOBS-FREE+PATCH32-APPROVAL-QUEUE-DELETE-FIX";'
+          if new_build not in text:
+              if old_build not in text:
+                  raise SystemExit('Could not locate OPS_BUILD suffix')
+              text = text.replace(old_build, new_build, 1)
+
+          processor_replacement = r'''    function pendingApprovalMarkup(){var pending=state.jobs.filter(function(job){return job.status==="pending"&&!job.archivedAt;});if(!pending.length)return '<section class="processor-approval-queue"><div class="processor-approval-head"><div><span class="eyebrow">APPROVAL GATE</span><h3>Jobs waiting to be approved</h3></div><strong>0</strong></div><p class="processor-approval-empty">No jobs are waiting for approval.</p></section>';return '<section class="processor-approval-queue"><div class="processor-approval-head"><div><span class="eyebrow">APPROVAL GATE</span><h3>Jobs waiting to be approved</h3></div><strong>'+pending.length+'</strong></div><div class="processor-approval-list">'+pending.map(function(job){return '<article class="processor-approval-card"><div><div class="queue-status-cluster"><span class="reference">'+esc(job.reference)+'</span><span class="badge pending">PENDING</span></div><h4>'+esc(job.requesterName)+'</h4><p>'+esc(job.pickupAddress)+' → '+esc(job.primaryDropoffAddress)+'</p><p><strong>'+esc(job.serviceLevel)+'</strong> · '+money(job.totalCents)+'</p></div><div class="processor-approval-actions"><button type="button" class="secondary" data-processor-pending-job="'+esc(job.reference)+'">OPEN JOB</button><button type="button" class="primary queue-approve" data-processor-approve="'+esc(job.reference)+'">APPROVE</button></div></article>';}).join('')+'</div></section>';}
+    function wirePendingApprovalActions(root){root.querySelectorAll('[data-processor-pending-job]').forEach(function(button){button.addEventListener('click',function(){switchSection('jobs');openJob(button.dataset.processorPendingJob,false);});});root.querySelectorAll('[data-processor-approve]').forEach(function(button){button.addEventListener('click',function(){quickApproveJob(button.dataset.processorApprove,button);});});}
+    function renderProcessor(){var processor=state.processor;var output=document.getElementById("processor-output");var approvals=pendingApprovalMarkup();if(!processor||!(processor.candidates||[]).length){output.innerHTML=approvals+'<div class="processor-empty"><strong>No actionable approved jobs.</strong><br><br>Approved and active jobs will enter the shared live queue here.</div>';wirePendingApprovalActions(output);return;}var routing=processor.routing||{};var routeClass=routing.mode==="traffic_aware"||routing.mode==="road_time"?"":" fallback";var routeTitle=routing.mode==="traffic_aware"?"LIVE TRAFFIC ACTIVE":routing.mode==="road_time"?"CURRENT ROAD TIMES ACTIVE":"COMMITMENT-ONLY FALLBACK";var origin=routing.origin&&routing.origin.label?" Start: "+routing.origin.label+".":"";var routeStatus='<div class="route-status'+routeClass+'"><strong>'+esc(routeTitle)+'</strong> · '+esc(routing.message||"")+esc(origin)+'</div>';var cards=processor.candidates.map(function(item,index){var stopLabel=item.stopType==="pickup"?"Pickup":"Drop-off "+Math.max(1,item.stopSequence-1);var deadlineLabel=item.deadlineStopType==="dropoff"?"Drop-off "+Math.max(1,item.deadlineStopSequence-1)+" deadline":"Latest";var timing=item.latestTime?deadlineLabel+": "+item.latestTime:(item.earliestTime?"Ready: "+item.earliestTime:"No fixed time");var road=Number.isFinite(item.travelMinutes)?'<p class="road-time">'+item.travelMinutes+' min · '+Number(item.travelKm||0).toFixed(1)+' km from start · ETA '+esc(timeText(item.etaAt))+'</p>':'';return '<article class="processor-card '+(index===0?'recommended':'')+'"><div class="processor-order">'+item.position+'</div><div><div class="card-top"><span class="reference">'+esc(item.reference)+'</span><span class="pressure '+esc(item.pressure.level)+'">'+esc(item.pressure.label)+'</span></div><h3>'+esc(stopLabel)+' · '+esc(item.suburb)+'</h3><p>'+esc(item.address)+'</p>'+road+'<p><strong>'+esc(item.serviceLevel)+'</strong> · '+esc(timing)+'</p><p>'+esc(item.pressure.explanation)+'</p>'+(index===0?'<p><strong>RECOMMENDED NEXT STOP</strong></p>':'')+'</div><div class="processor-actions"><a class="nav-btn" href="'+maps(item.address)+'" target="_blank" rel="noopener">NAVIGATE</a><button class="secondary" data-processor-job="'+esc(item.reference)+'">OPEN JOB</button></div></article>';}).join("");var conflicts=(processor.conflicts||[]).map(function(conflict){return '<div class="conflict"><strong>'+(conflict.level==="critical"?"Projected route conflict":"Potential timing clash")+'</strong><p>'+esc(conflict.message)+'</p></div>';}).join("")||'<p>No route or close-deadline clashes detected.</p>';var limits=(processor.limits||[]).map(function(limit){return '<li>'+esc(limit)+'</li>';}).join("");var counts=processor.counts||{};output.innerHTML=approvals+routeStatus+'<div class="stats"><div class="stat"><strong>'+Number(counts.jobs||0)+'</strong><span>Actionable jobs</span></div><div class="stat"><strong>'+Number(counts.critical||0)+'</strong><span>Critical now</span></div><div class="stat"><strong>'+Number(counts.strict||0)+'</strong><span>Strict windows</span></div><div class="stat"><strong>'+Number(counts.potentialConflicts||0)+'</strong><span>Potential clashes</span></div></div><div class="processor-grid"><div class="processor-stack">'+cards+'</div><aside class="processor-side"><div class="processor-panel"><h3>Timing watch</h3>'+conflicts+'</div><div class="processor-panel"><h3>Processor rules</h3><ul>'+limits+'</ul></div></aside></div>';wirePendingApprovalActions(output);output.querySelectorAll("[data-processor-job]").forEach(function(button){button.addEventListener("click",function(){switchSection("jobs");openJob(button.dataset.processorJob,false);});});}
+    async function quickApproveJob(reference,button){if(button)button.classList.add('busy');try{var data=await api('/operations/api/jobs/'+encodeURIComponent(reference),{method:'PATCH',body:{status:'approved',note:''}});state.jobs=state.jobs.map(function(job){return job.reference===reference?Object.assign({},job,{status:data.job.status,paymentStatus:data.job.paymentStatus,finance:data.job.finance,paymentGate:data.job.paymentGate}):job;});renderStats();renderJobs();state.processor=null;if(state.selectedJob===reference&&state.section==='jobs')await openJob(reference,false);if(state.section==='processor')await loadProcessor();if(data.paymentCheckout&&data.paymentCheckout.error){alert('Job approved and safely payment-gated, but the Stripe payment link could not be created: '+data.paymentCheckout.error);}else if(data.paymentCheckout&&data.paymentCheckout.checkout&&!data.paymentCheckout.checkout.emailSent){alert('Job approved and payment-gated. Stripe checkout was created, but the customer email failed: '+(data.paymentCheckout.checkout.emailError||'unknown email error'));}else{showToast('Job approved.');}}catch(error){alert(error.message);}finally{if(button)button.classList.remove('busy');}}
+'''
+          text = replace_between(text, '    function renderProcessor(){', '    function filteredJobs(){', processor_replacement)
+
+          jobs_replacement = r'''    function renderJobs(){var jobs=filteredJobs();var list=document.getElementById("job-list");if(!jobs.length){list.innerHTML='<div class="empty">No jobs in this view.</div>';return;}list.innerHTML=jobs.map(function(job){var pending=job.status==='pending';var top=pending?'<div class="queue-status-cluster"><span class="reference">'+esc(job.reference)+'</span><span class="badge pending">PENDING</span></div><button type="button" class="primary queue-approve" data-approve-job="'+esc(job.reference)+'">APPROVE</button>':'<span class="reference">'+esc(job.reference)+'</span><span class="badge '+esc(job.status)+'">'+esc(job.status)+'</span>';return '<article class="card '+(state.selectedJob===job.reference?'selected':'')+'" data-job="'+esc(job.reference)+'" role="button" tabindex="0" title="Click for summary · Double-click for full job"><div class="card-top">'+top+'</div><h3>'+esc(job.requesterName)+'</h3><p>'+esc(job.pickupAddress)+' → '+esc(job.primaryDropoffAddress)+'</p><p><strong>'+esc(job.serviceLevel)+'</strong> · <span class="money">'+money(job.totalCents)+'</span></p></article>';}).join("");list.querySelectorAll("[data-job]").forEach(function(card){card.addEventListener("click",function(event){if(event.target.closest('[data-approve-job]'))return;clearTimeout(jobClickTimer);jobClickTimer=setTimeout(function(){openJob(card.dataset.job,false);},220);});card.addEventListener("dblclick",function(event){if(event.target.closest('[data-approve-job]'))return;event.preventDefault();clearTimeout(jobClickTimer);openJob(card.dataset.job,true);});card.addEventListener('keydown',function(event){if((event.key==='Enter'||event.key===' ')&&!event.target.closest('[data-approve-job]')){event.preventDefault();openJob(card.dataset.job,false);}});});list.querySelectorAll('[data-approve-job]').forEach(function(button){button.addEventListener('click',function(event){event.preventDefault();event.stopPropagation();quickApproveJob(button.dataset.approveJob,button);});});}
+'''
+          text = replace_between(text, '    function renderJobs(){', '    function renderJobSummary(job){', jobs_replacement)
+
+          css_marker = '    /* FINAL V22 MANDATORY DELIVERY PHOTO */'
+          css_patch = r'''    /* PATCH32 APPROVAL QUEUE */
+    .queue-status-cluster{display:flex;align-items:center;gap:7px;min-width:0;flex:1}.queue-status-cluster .reference{min-width:0;overflow:hidden;text-overflow:ellipsis}.queue-approve{min-height:28px!important;padding:0 10px!important;font-size:8px!important;letter-spacing:.05em!important;flex:0 0 auto}.processor-approval-queue{border:1px solid rgba(255,182,72,.22);border-left:3px solid var(--amber);border-radius:10px;background:linear-gradient(120deg,rgba(255,182,72,.07),#111419 42%);padding:16px;margin-bottom:16px}.processor-approval-head{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-bottom:11px}.processor-approval-head .eyebrow{display:block;color:#9d835b;margin-bottom:5px}.processor-approval-head h3{margin:0;font-size:15px;letter-spacing:-.02em}.processor-approval-head>strong{display:grid;place-items:center;min-width:34px;height:28px;border:1px solid rgba(255,182,72,.28);border-radius:999px;color:var(--amber);font-size:11px}.processor-approval-list{display:grid;gap:8px}.processor-approval-card{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:center;border:1px solid #2b3139;border-radius:8px;background:#14181d;padding:13px}.processor-approval-card h4{margin:8px 0 4px;font-size:12px}.processor-approval-card p{margin:3px 0;color:#7d8793;font-size:9px;line-height:1.45}.processor-approval-actions{display:flex;gap:7px;align-items:center}.processor-approval-empty{margin:0;color:#727c88;font-size:9px}@media(max-width:760px){.processor-approval-card{grid-template-columns:1fr}.processor-approval-actions{display:grid;grid-template-columns:1fr 1fr}.processor-approval-actions>*{width:100%}}
+'''
+          if css_patch not in text:
+              if css_marker not in text:
+                  raise SystemExit('Could not find CSS insertion marker')
+              text = text.replace(css_marker, css_patch + css_marker, 1)
+
+          path.write_text(text)
+          PY
+
+      - name: Check Worker JavaScript syntax
+        run: node --check worker.js
+      - name: Commit patch
+        run: |
+          if git diff --quiet -- worker.js; then
+            echo "No changes needed."
+            exit 0
+          fi
+          git config user.name "SorrinMelbourne"
+          git config user.email "speak2salem@gmail.com"
+          git add worker.js
+          git commit -m "Add quick approvals and fix job delete"
+          git push origin main
