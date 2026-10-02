@@ -18,7 +18,7 @@ function corsHeaders(request) {
 
 const OPS_COOKIE_NAME = "sorrin_ops_session";
 const OPS_SESSION_SECONDS = 60 * 60 * 12;
-const OPS_BUILD = "FINAL-V21-SUMMARY-FINANCE-NAV+A022-SORRINBOT-FINANCE+A027-BUSINESS-PROFILE+A035-MEMBERSHIP-LIST+A037-CONSULTATION-REQUEST+A039-SESSION-RESUME+PATCH30-USC-ONLY-BOOKING+V22-MANDATORY-DELIVERY-PHOTO+PATCH31-FIRST-TWO-JOBS-FREE+PATCH32-APPROVAL-QUEUE-DELETE-FIX+PATCH33-DELIVERY-PHOTO-UPLOAD-FIX+PATCH34-MOBILE-ACCOUNT-FORM";
+const OPS_BUILD = "FINAL-V21-SUMMARY-FINANCE-NAV+A022-SORRINBOT-FINANCE+A027-BUSINESS-PROFILE+A035-MEMBERSHIP-LIST+A037-CONSULTATION-REQUEST+A039-SESSION-RESUME+PATCH30-USC-ONLY-BOOKING+V22-MANDATORY-DELIVERY-PHOTO+PATCH31-FIRST-TWO-JOBS-FREE+PATCH32-APPROVAL-QUEUE-DELETE-FIX+PATCH33-DELIVERY-PHOTO-UPLOAD-FIX+PATCH34-MOBILE-ACCOUNT-FORM+PATCH35-BOOKING-EMAIL-STATUS";
 const SORRINBOT_USC_SESSION_VERSION = "1.0.0";
 const SORRINBOT_USC_REGISTRATION_VERSION = "A017-1.0.0";
 const SORRINBOT_REPEAT_JOB_VERSION = "A018-1.0.0";
@@ -1046,32 +1046,85 @@ async function hashValue(value) {
 
 /**
  * @param {any} env
- * @param {{ to: string, subject: string, text: string, html: string, from?: string, replyTo?: string }} message
+ * @param {{ to: string, subject: string, text: string, html: string, from?: string, replyTo?: string, idempotencyKey?: string }} message
  */
-async function sendEmail(env, { to, subject, text, html, from, replyTo }) {
-  const response = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${env.RESEND_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      from: from || "Sorrin Courier <courier@sorrin.com.au>",
-      to: [to],
-      reply_to: replyTo || "courier@sorrin.com.au",
-      subject,
-      text,
-      html,
-    }),
+async function sendEmail(env, { to, subject, text, html, from, replyTo, idempotencyKey }) {
+  const apiKey = String(env.RESEND_API_KEY || "").trim();
+  if (!apiKey) throw new Error("Email service is not configured (RESEND_API_KEY missing)");
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json",
+  };
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  const payload = JSON.stringify({
+    from: from || "Sorrin Courier <courier@sorrin.com.au>",
+    to: [to],
+    reply_to: replyTo || "courier@sorrin.com.au",
+    subject,
+    text,
+    html,
   });
 
-  const result = await response.json();
-
-  if (!response.ok) {
-    throw new Error(result.message || "Email could not be sent");
+  // Retry only keyed sends: a timeout after provider acceptance must never create
+  // two booking alerts. Permanent provider errors are returned to the caller.
+  const attempts = idempotencyKey ? 2 : 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    let response;
+    try {
+      response = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers,
+        body: payload,
+      });
+    } catch (error) {
+      if (attempt + 1 < attempts) continue;
+      throw new Error("Email provider could not be reached");
+    }
+    const result = await response.json().catch(() => ({}));
+    if (response.ok) {
+      if (!result?.id) throw new Error("Email provider did not confirm acceptance");
+      return result;
+    }
+    if ((response.status === 429 || response.status >= 500) && attempt + 1 < attempts) continue;
+    throw new Error(
+      `Email provider rejected the message (HTTP ${response.status}): ${cleanText(result?.message || "No reason supplied", 200)}`,
+    );
   }
+}
 
-  return result;
+async function recordBookingEmail(env, bookingId, channel, status, providerId = null, error = null) {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO job_events (id, job_id, event_type, event_data)
+       VALUES (?, ?, 'booking_email', ?)`,
+    ).bind(
+      crypto.randomUUID(),
+      `job:${bookingId}`,
+      JSON.stringify({ channel, status, providerId, error: error ? cleanText(error, 250) : null }),
+    ).run();
+  } catch (eventError) {
+    // The booking and the email outcome must not be rolled back by an audit failure.
+    console.error({ event: "booking_email_audit_failed", bookingId, channel, message: eventError?.message });
+  }
+}
+
+async function sendOwnerBookingEmail(env, { id, reference, bookingType, requesterDetails, details, idempotencyKey }) {
+  try {
+    const result = await sendEmail(env, {
+      to: "courier@sorrin.com.au",
+      from: "Sorrin Booking Alerts <notifications@sorrin.com.au>",
+      subject: `${bookingType === "sorrinbot" ? "USC SorrinBot" : bookingType === "guest" ? "Guest" : "Business"} booking request ${reference}`,
+      text: `${requesterDetails}\n\n${details}`,
+      html: `<div style="font-family:Arial,sans-serif;max-width:720px;margin:auto;padding:32px;color:#111;line-height:1.5;"><h1>NEW SORRIN BOOKING</h1><pre style="white-space:pre-wrap;font:14px/1.5 Arial,sans-serif;background:#f5f5f5;padding:20px;border-radius:8px;">${escapeHtml(`${requesterDetails}\n\n${details}`)}</pre></div>`,
+      idempotencyKey,
+    });
+    await recordBookingEmail(env, id, "owner", "accepted", result.id);
+    return { accepted: true, providerId: result.id };
+  } catch (error) {
+    await recordBookingEmail(env, id, "owner", "failed", null, error?.message);
+    console.error({ event: "booking_owner_email_failed", bookingId: id, reference, message: error?.message });
+    return { accepted: false, error: error?.message || "Owner email could not be sent" };
+  }
 }
 
 function stripeMode(env) {
@@ -5974,6 +6027,74 @@ async function operationsApi(request, env, url) {
     return operationsJson({ job: await operationsJobDetail(env, reference) });
   }
 
+  const bookingEmailMatch = path.match(
+    /^\/operations\/api\/jobs\/([^/]+)\/booking-email$/,
+  );
+  if (bookingEmailMatch && ["GET", "POST"].includes(request.method)) {
+    const reference = decodeURIComponent(bookingEmailMatch[1]).toUpperCase();
+    const booking = await env.DB.prepare(
+      `SELECT id, reference, booking_type, business_name_or_usc, requester_name,
+              requester_email, requester_phone, payment_method, payload_json, usc_verified
+       FROM booking_requests WHERE reference = ? COLLATE NOCASE LIMIT 1`,
+    ).bind(reference).first();
+    if (!booking) return operationsJson({ error: "Booking not found" }, 404);
+
+    if (request.method === "POST") {
+      const quote = parseJson(booking.payload_json, {}).quote || {};
+      const requesterDetails = [
+        `Reference: ${booking.reference}`,
+        `Booking type: ${booking.booking_type}`,
+        `Business / USC: ${booking.business_name_or_usc || "Not supplied"}`,
+        `USC verified: ${booking.usc_verified ? "Yes" : "No"}`,
+        `Name: ${booking.requester_name}`,
+        `Email: ${booking.requester_email}`,
+        `Phone: ${booking.requester_phone}`,
+        `Payment method: ${booking.payment_method || "Not selected"}`,
+      ].join("\n");
+      const result = await sendOwnerBookingEmail(env, {
+        id: booking.id,
+        reference: booking.reference,
+        bookingType: booking.booking_type,
+        requesterDetails,
+        details: quoteText(quote),
+        // A deliberate resend is a new message. Retries within that request use
+        // the same key, so a network timeout cannot create duplicate alerts.
+        idempotencyKey: `booking-owner-resend-${booking.id}-${crypto.randomUUID()}`,
+      });
+      if (!result.accepted) return operationsJson({ error: result.error }, 502);
+      return operationsJson({ accepted: true, providerId: result.providerId });
+    }
+
+    const event = await env.DB.prepare(
+      `SELECT event_data, created_at FROM job_events
+       WHERE job_id = ? AND event_type = 'booking_email'
+         AND json_extract(event_data, '$.channel') = 'owner'
+       ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+    ).bind(`job:${booking.id}`).first();
+    if (!event) return operationsJson({ status: "untracked", configured: Boolean(env.RESEND_API_KEY) });
+    const data = parseJson(event.event_data, {});
+    const status = {
+      status: data.status,
+      providerId: data.providerId || null,
+      error: data.error || null,
+      recordedAt: event.created_at,
+      configured: Boolean(env.RESEND_API_KEY),
+    };
+    if (data.status === "accepted" && data.providerId && env.RESEND_API_KEY) {
+      try {
+        const response = await fetch(`https://api.resend.com/emails/${encodeURIComponent(data.providerId)}`, {
+          headers: { Authorization: `Bearer ${env.RESEND_API_KEY}` },
+        });
+        const provider = await response.json().catch(() => ({}));
+        if (response.ok) status.lastEvent = provider.last_event || "accepted";
+        else status.statusError = `Provider status unavailable (HTTP ${response.status})`;
+      } catch {
+        status.statusError = "Provider status unavailable";
+      }
+    }
+    return operationsJson(status);
+  }
+
   const executeJobMatch = path.match(
     /^\/operations\/api\/jobs\/([^/]+)\/execute-next$/,
   );
@@ -7430,6 +7551,41 @@ function operationsDashboardHtml(env) {
     function installDeliveryPhotoUi(job,fullPage){var panel=document.getElementById('job-detail');var body=panel&&panel.querySelector('.detail-body');if(!body)return;var action=job.execution||{};var show=fullPage?['approved','active','delivered'].indexOf(job.status)>-1:['delivery_photo_required','complete_job'].indexOf(action.code)>-1||job.status==='delivered';var deliveredOption=panel.querySelector('#job-status option[value="delivered"]');if(deliveredOption&&!job.deliveryPhoto){deliveredOption.disabled=true;deliveredOption.textContent='DELIVERED — PHOTO REQUIRED';}if(!show)return;var old=body.querySelector('[data-delivery-photo]');if(old)old.remove();var holder=document.createElement('div');holder.innerHTML=deliveryPhotoSectionHtml(job);var section=holder.firstElementChild;var execution=body.querySelector('.execution-panel');if(execution)body.insertBefore(section,execution);else body.insertBefore(section,body.firstChild);if(action.code==='delivery_photo_required'&&!execution){execution=document.createElement('section');execution.className='section execution-panel photo-blocked';execution.innerHTML='<h3>Live job execution</h3><p>The final handover is ready to close.</p><div class="photo-gate-note">Upload the delivery photo above to unlock MARK AS DELIVERED.</div><div style="margin-top:12px"><button type="button" class="execution-primary" disabled>DELIVERY PHOTO REQUIRED</button></div>';section.insertAdjacentElement('afterend',execution);}bindDeliveryPhotoForm(job,section);if(action.code==='delivery_photo_required'&&execution){execution.classList.add('photo-blocked');if(!execution.querySelector('.photo-gate-note')){var note=document.createElement('div');note.className='photo-gate-note';note.textContent='Upload the delivery photo above to unlock MARK AS DELIVERED.';execution.insertBefore(note,execution.querySelector('div')||execution.lastChild);}}if(!job.deliveryPhoto){var finalButton=action.stopId?Array.from(panel.querySelectorAll('[data-stop][data-stop-status="completed"]')).find(function(candidate){return candidate.dataset.stop===action.stopId;}):null;if(finalButton&&action.code==='delivery_photo_required'){finalButton.disabled=true;finalButton.classList.add('photo-blocked');finalButton.textContent='PHOTO REQUIRED';}Array.from(panel.querySelectorAll('.detail-actions button')).forEach(function(candidate){if(candidate.textContent.trim()==='FORCE CLOSE JOB'){candidate.disabled=true;candidate.classList.add('photo-blocked');candidate.title='Upload a delivery photo first';}});}}
     var renderJobDetailV22Base=renderJobDetail;
     renderJobDetail=function(job){renderJobDetailV22Base(job);installDeliveryPhotoUi(job,true);};
+    function bookingEmailPanel(job){
+      var body=document.querySelector('#job-detail .detail-body');if(!body)return;
+      var panel=document.createElement('section');panel.className='section';
+      panel.innerHTML='<h3>Owner booking email</h3><p data-booking-email-status>Checking delivery status…</p><div class="detail-actions"><button type="button" class="secondary" data-booking-email-check>CHECK STATUS</button><button type="button" class="secondary" data-booking-email-resend>RESEND OWNER EMAIL</button></div>';
+      body.insertBefore(panel,body.firstChild);
+      var status=panel.querySelector('[data-booking-email-status]');
+      async function check(){
+        status.textContent='Checking delivery status…';
+        try{
+          var data=await api('/operations/api/jobs/'+encodeURIComponent(job.reference)+'/booking-email');
+          if(!panel.isConnected)return;
+          if(!data.configured){status.textContent='Email service is not configured: add RESEND_API_KEY to the Courier Worker.';return;}
+          if(data.status==='untracked'){status.textContent='No email record for this booking. Older bookings were not tracked.';return;}
+          if(data.status==='failed'){status.textContent='Send failed: '+(data.error||'Unknown provider error');return;}
+          var event=data.lastEvent||'accepted';
+          status.textContent=event==='delivered'?'Delivered to the receiving mail server. Check spam and mailbox rules if it is missing.':
+            ['bounced','failed','suppressed','complained'].indexOf(event)>-1?'Delivery problem: '+event+'. Check the recipient and Resend logs.':
+            'Resend status: '+event+'. This does not yet confirm inbox delivery.';
+          if(data.statusError)status.textContent+=' '+data.statusError;
+          if(data.providerId)status.textContent+=' Provider ID: '+data.providerId;
+        }catch(error){if(panel.isConnected)status.textContent=error.message;}
+      }
+      panel.querySelector('[data-booking-email-check]').addEventListener('click',check);
+      panel.querySelector('[data-booking-email-resend]').addEventListener('click',async function(event){
+        var button=event.currentTarget;button.disabled=true;status.textContent='Sending the owner booking email…';
+        try{
+          await api('/operations/api/jobs/'+encodeURIComponent(job.reference)+'/booking-email',{method:'POST',body:{}});
+          showToast('Owner booking email accepted by Resend.');await check();
+        }catch(error){status.textContent='Resend failed: '+error.message;}
+        finally{button.disabled=false;}
+      });
+      check();
+    }
+    var renderJobDetailEmailBase=renderJobDetail;
+    renderJobDetail=function(job){renderJobDetailEmailBase(job);bookingEmailPanel(job);};
     var renderJobSummaryV22Base=renderJobSummary;
     renderJobSummary=function(job){renderJobSummaryV22Base(job);installDeliveryPhotoUi(job,false);};
     function switchSection(section){state.section=section;localStorage.setItem("sorrin_ops_section",section);history.replaceState(null,"","#"+section);document.querySelectorAll("[data-section]").forEach(function(button){var active=button.dataset.section===section;button.classList.toggle("active",active);button.setAttribute("aria-current",active?"page":"false");});document.getElementById("processor-section").classList.toggle("hidden",section!=="processor");document.getElementById("jobs-section").classList.toggle("hidden",section!=="jobs");document.getElementById("accounts-section").classList.toggle("hidden",section!=="accounts");document.getElementById("finance-section").classList.toggle("hidden",section!=="finance");document.getElementById("job-stats").classList.toggle("hidden",section!=="jobs");document.getElementById("new-job-top").classList.toggle("hidden",section!=="jobs");document.getElementById("new-account-top").classList.toggle("hidden",section!=="accounts");var titles={processor:"Conscious Processor",jobs:"Courier jobs",finance:"Finance",accounts:"USC accounts"};var subtitles={processor:"Live dispatch, ordered by pressure and promise",jobs:"Approve, execute and close every movement",finance:"Prepayments, invoices and collection",accounts:"Private client control, tags and benefits"};var crumbs={processor:"DISPATCH",jobs:"JOBS",finance:"FINANCE",accounts:"USC ACCOUNTS"};document.getElementById("page-title").textContent=titles[section]||titles.jobs;document.getElementById("page-subtitle").textContent=subtitles[section]||subtitles.jobs;document.getElementById("section-breadcrumb").textContent="OPERATIONS / "+(crumbs[section]||crumbs.jobs);document.title=(titles[section]||titles.jobs)+" · Sorrin Command Console";setCommandOpen(false);if(section==="processor")loadProcessor();if(section==="finance")renderFinances();}
@@ -9456,28 +9612,34 @@ async function prepareSorrinbotCourierBooking(env, { responseId, booking }, now 
   };
 }
 
-async function notifySorrinbotBookingSubmission(env, business, reference, payload) {
+async function notifySorrinbotBookingSubmission(env, business, reference, payload, bookingId) {
   const quote = payload.quote || {};
   const requester = payload.requester || {};
   const details = quoteText(quote);
-  let warning = null;
+  const owner = await sendOwnerBookingEmail(env, {
+    id: bookingId,
+    reference,
+    bookingType: "sorrinbot",
+    requesterDetails: `SorrinBot submitted an authenticated USC booking request.\nReference: ${reference}\nUSC: ${business.usc}\nBusiness: ${business.business_name}\nName: ${requester.requesterName}\nEmail: ${requester.requesterEmail}\nPhone: ${requester.requesterPhone}`,
+    details,
+    idempotencyKey: `booking-owner-${bookingId}`,
+  });
+  let customerError = null;
   try {
-    await sendEmail(env, {
-      to: "courier@sorrin.com.au",
-      subject: `USC SorrinBot booking request ${reference}`,
-      text: `SorrinBot submitted an authenticated USC booking request.\n\nReference: ${reference}\nUSC: ${business.usc}\nBusiness: ${business.business_name}\n\n${details}`,
-      html: `<div style="font-family:Arial,sans-serif;max-width:720px;margin:auto;padding:32px;color:#111;line-height:1.5;"><h1>NEW SORRINBOT USC BOOKING</h1><p><strong>${escapeHtml(reference)}</strong></p><p>${escapeHtml(business.usc)} · ${escapeHtml(business.business_name)}</p><pre style="white-space:pre-wrap;font:14px/1.5 Arial,sans-serif;background:#f5f5f5;padding:20px;border-radius:8px;">${escapeHtml(details)}</pre></div>`,
-    });
-    await sendEmail(env, {
+    const result = await sendEmail(env, {
       to: requester.requesterEmail,
       subject: `Sorrin booking request received - ${reference}`,
       text: `Hi ${requester.requesterName},\n\nYour USC booking request has been submitted to Sorrin for approval. It is not confirmed until Sorrin reviews and accepts it.\n\nReference: ${reference}\n\n${details}\n\nKind regards,\nSorrin`,
       html: `<div style="font-family:Arial,sans-serif;max-width:680px;margin:auto;padding:32px;color:#111;line-height:1.5;"><h1>SORRIN COURIER</h1><p>Hi ${escapeHtml(requester.requesterName)},</p><p>Your USC booking request has been submitted to Sorrin for approval. It is not confirmed until Sorrin reviews and accepts it.</p><p><strong>Reference: ${escapeHtml(reference)}</strong></p><pre style="white-space:pre-wrap;font:14px/1.5 Arial,sans-serif;background:#f5f5f5;padding:20px;border-radius:8px;">${escapeHtml(details)}</pre><p>Kind regards,<br>Sorrin</p></div>`,
+      idempotencyKey: `booking-customer-${bookingId}`,
     });
+    await recordBookingEmail(env, bookingId, "customer", "accepted", result.id);
   } catch (error) {
-    warning = error?.message || "Booking notifications could not be sent.";
+    customerError = error?.message || "Customer email could not be sent";
+    await recordBookingEmail(env, bookingId, "customer", "failed", null, customerError);
   }
-  return warning;
+  return [owner.accepted ? null : `Owner email: ${owner.error}`, customerError ? `Customer email: ${customerError}` : null]
+    .filter(Boolean).join("; ") || null;
 }
 
 async function confirmSorrinbotCourierBooking(env, { responseId, preparationId }, now = new Date()) {
@@ -9613,7 +9775,7 @@ async function confirmSorrinbotCourierBooking(env, { responseId, preparationId }
        WHERE id = ?`,
     ).bind(requestRow.reference, bookingRequestId, nowIso, id).run();
 
-    const notificationWarning = await notifySorrinbotBookingSubmission(env, business, requestRow.reference, payload);
+    const notificationWarning = await notifySorrinbotBookingSubmission(env, business, requestRow.reference, payload, bookingRequestId);
     return {
       ok: true,
       submitted: true,
@@ -11397,27 +11559,22 @@ export default {
         `Payment method: ${paymentMethod || "Not selected"}`,
       ].join("\n");
 
-      let notificationWarning = null;
+      const owner = await sendOwnerBookingEmail(env, {
+        id,
+        reference,
+        bookingType,
+        requesterDetails,
+        details,
+        idempotencyKey: `booking-owner-${id}`,
+      });
 
+      const customerMessage =
+        bookingType === "guest"
+          ? `Your guest booking has been submitted for manual approval. It is not guaranteed until Sorrin confirms it, and pre-payment may be required.`
+          : `Your business booking request has been submitted for approval. It is not confirmed until Sorrin reviews and accepts it.`;
+      let customerError = null;
       try {
-        await sendEmail(env, {
-          to: "courier@sorrin.com.au",
-          subject: `${bookingType === "guest" ? "Guest" : "Business"} booking request ${reference}`,
-          text: `${requesterDetails}\n\n${details}`,
-          html: `
-            <div style="font-family:Arial,sans-serif;max-width:720px;margin:auto;padding:32px;color:#111;line-height:1.5;">
-              <h1 style="margin:0 0 22px;">NEW SORRIN BOOKING</h1>
-              <pre style="white-space:pre-wrap;font:14px/1.5 Arial,sans-serif;background:#f5f5f5;padding:20px;border-radius:8px;">${escapeHtml(`${requesterDetails}\n\n${details}`)}</pre>
-            </div>
-          `,
-        });
-
-        const customerMessage =
-          bookingType === "guest"
-            ? `Your guest booking has been submitted for manual approval. It is not guaranteed until Sorrin confirms it, and pre-payment may be required.`
-            : `Your business booking request has been submitted for approval. It is not confirmed until Sorrin reviews and accepts it.`;
-
-        await sendEmail(env, {
+        const result = await sendEmail(env, {
           to: requesterEmail,
           subject: `Sorrin booking request received - ${reference}`,
           text: `Hi ${requesterName},\n\n${customerMessage}\n\nReference: ${reference}\n\n${details}\n\nKind regards,\nSorrin`,
@@ -11431,10 +11588,15 @@ export default {
               <p>Kind regards,<br>Sorrin</p>
             </div>
           `,
+          idempotencyKey: `booking-customer-${id}`,
         });
+        await recordBookingEmail(env, id, "customer", "accepted", result.id);
       } catch (error) {
-        notificationWarning = error.message;
+        customerError = error?.message || "Customer email could not be sent";
+        await recordBookingEmail(env, id, "customer", "failed", null, customerError);
       }
+      const notificationWarning = [owner.accepted ? null : `Owner email: ${owner.error}`, customerError ? `Customer email: ${customerError}` : null]
+        .filter(Boolean).join("; ") || null;
 
       return jsonResponse(
         request,
@@ -11442,6 +11604,8 @@ export default {
           submitted: true,
           reference,
           notificationSent: !notificationWarning,
+          ownerNotificationSent: owner.accepted,
+          customerNotificationSent: !customerError,
           notificationWarning,
         },
         notificationWarning ? 202 : 201,
