@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "worker.js"
+      - "tests/**"
       - ".github/workflows/deploy-courier-worker.yml"
   workflow_dispatch:
 
@@ -22,6 +23,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check Worker JavaScript syntax
         run: node --check worker.js
+      - name: Verify booking email handling
+        run: node --test tests/booking-email.test.mjs
       - name: Publish Worker code without changing Cloudflare bindings or settings
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
